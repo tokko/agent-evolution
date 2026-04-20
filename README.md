@@ -9,21 +9,40 @@ A persistent, self-evolving dev team in a single Go binary.
 
 No frameworks. Stdlib only, plus `modernc.org/sqlite` (pure Go, no CGO).
 
-## Quick start
+## Install (one-liner)
 
 ```bash
-# 1. copy the example env and fill in your MiniMax key
+curl -fsSL https://raw.githubusercontent.com/tokko/agent-evolution/main/install.sh | bash
+```
+
+The script clones into `~/agent-evolution`, copies `.env.example` → `.env`,
+builds `bin/daemon`, and (if Docker is present) builds the sandbox image.
+Override with env vars:
+
+```bash
+AE_DIR=/opt/ae AE_SKIP_IMAGE=1 curl -fsSL .../install.sh | bash
+```
+
+| var | default | effect |
+|---|---|---|
+| `AE_DIR` | `$HOME/agent-evolution` | install target |
+| `AE_REF` | `main` | git ref to check out |
+| `AE_SKIP_BUILD` | — | set to `1` to skip `go build` |
+| `AE_SKIP_IMAGE` | — | set to `1` to skip `docker build` |
+
+After install, edit `.env` to set `MINIMAX_API_KEY`, then run
+`bin/daemon --repo <your-target-repo>` and open `http://localhost:8080`.
+
+## Manual setup
+
+```bash
+git clone https://github.com/tokko/agent-evolution.git
+cd agent-evolution
 cp .env.example .env
 $EDITOR .env          # set MINIMAX_API_KEY
-
-# 2. build the sandbox image (lazy at first task run, but pre-building is fine)
 docker build -f sandbox.Dockerfile -t agent-sandbox:latest .
-
-# 3. run against a target repo
-go run . --repo git@github.com:you/your-project.git
-
-# 4. open the board
-open http://localhost:8080
+go build -o bin/daemon .
+./bin/daemon --repo git@github.com:you/your-project.git
 ```
 
 Drop a card on the board. Watch it move `todo → doing → done` as Genesis reads, writes, runs, commits, and pushes.
