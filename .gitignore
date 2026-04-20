@@ -1,0 +1,9 @@
+.env
+memory.db
+memory.db-*
+bin/
+workspace/
+tmp/
+*.exe
+daemon
+daemon.new

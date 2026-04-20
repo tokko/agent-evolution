@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>task #{{.Task.ID}} — {{.Task.Title}}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; margin: 0; background: #f5f5f5; color: #222; }
+  header { background: #1a1a1a; color: #eee; padding: 10px 16px; display: flex; align-items: center; gap: 16px; }
+  header a { color: #9cf; text-decoration: none; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  .meta { background: #fff; padding: 12px 14px; border-radius: 6px; border: 1px solid #ddd; margin-bottom: 14px; }
+  .meta pre { white-space: pre-wrap; margin: 8px 0 0; color: #444; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; background: #ddd; color: #333; }
+  .pill.done { background: #cdb; color: #284; }
+  .pill.failed { background: #edc; color: #833; }
+  .pill.doing { background: #cde; color: #246; }
+  .timeline { background: #fff; border-radius: 6px; border: 1px solid #ddd; }
+  .ev { padding: 8px 14px; border-top: 1px solid #eee; }
+  .ev:first-child { border-top: none; }
+  .ev header { background: none; color: #666; padding: 0; font-size: 11px; display: flex; gap: 10px; align-items: baseline; }
+  .ev header .kind { font-weight: 600; color: #333; text-transform: uppercase; letter-spacing: 0.04em; font-size: 10px; }
+  .ev pre { margin: 4px 0 0; white-space: pre-wrap; font-size: 12px; color: #444; background: #f7f7f7; padding: 6px 8px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>task #{{.Task.ID}} — {{.Task.Title}}</h1>
+  <a href="/">&larr; board</a>
+</header>
+<main>
+  <section class="meta">
+    <span class="pill {{.Task.Column}}">{{.Task.Column}}</span>
+    <span style="color:#888;font-size:12px;margin-left:8px">created {{fmtTime .Task.CreatedAt}} · updated {{fmtTime .Task.UpdatedAt}}</span>
+    {{if .Task.Body}}<pre>{{.Task.Body}}</pre>{{end}}
+  </section>
+  <section class="timeline">
+    {{range .Events}}
+    <div class="ev">
+      <header>
+        <span class="kind">{{.Kind}}</span>
+        <span>{{fmtTime .CreatedAt}}</span>
+        {{if .AttemptID}}<span>attempt #{{derefInt .AttemptID}}</span>{{end}}
+      </header>
+      <pre>{{.Payload}}</pre>
+    </div>
+    {{else}}
+    <div class="ev"><em style="color:#888">(no events yet)</em></div>
+    {{end}}
+  </section>
+</main>
+</body>
+</html>
