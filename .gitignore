@@ -6,3 +6,6 @@ tmp/
 *.exe
 daemon
 daemon.new
+verify.pending
+verify.approved
+verify.rejected

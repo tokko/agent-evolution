@@ -69,12 +69,37 @@ tail -F events.jsonl
    - runs `go build -o bin/daemon.new .`,
    - on build failure, reverses the patch and returns the error to the
      model,
-   - on success, `syscall.Exec`'s into the new binary with
-     `--resume --self-src <dir> --log <path>` so the next process
-     continues from the new source.
+   - on success, **promotes** `bin/daemon.new` → `bin/daemon` (backing up
+     the previous binary to `bin/daemon.prev`),
+   - **waits for `CYCLE_INTERVAL`** (default 1m) before exec'ing, so the
+     agent can't burn through tokens faster than the configured cadence,
+   - `syscall.Exec`'s into the promoted binary with `--resume`.
 6. The loop runs up to `MAX_STEPS` (default 25) iterations in one
    process lifetime. After a successful `edit_self`, the counter resets
    in the new binary.
+
+## Stopping — human verification
+
+The `done` tool is **not** an immediate stop. When the agent believes it
+has reached the target system, the daemon:
+
+1. Writes `./verify.pending` with the agent's summary.
+2. Prints a `[VERIFY]` banner on stderr with instructions.
+3. Pauses the loop (no LLM calls, no CPU) and polls every 10 s for one
+   of two sidecar files in the source dir:
+
+   - `verify.approved` — loop ends cleanly with outcome `done`.
+     ```
+     touch verify.approved
+     ```
+   - `verify.rejected` — contents are injected into the model's next
+     turn as a rejection reason; the loop continues.
+     ```
+     echo "you still need X, Y, Z" > verify.rejected
+     ```
+
+Ctrl-C at the daemon also exits. Sidecar files are cleared automatically
+once handled so the next `done` proposal starts clean.
 
 ## Running on Raspberry Pi 5
 
@@ -108,7 +133,8 @@ $EDITOR .env
 | `--self-src <dir>` | dir of binary / cwd | where to read+patch source |
 | `--log <path>` | `./events.jsonl` | append-only JSONL event log |
 | `--max-steps <n>` | 25 | cap on iterations per process |
-| `--sleep <s>` | 0 | pause between steps |
+| `--sleep <s>` | 0 | pause between LLM steps |
+| `--cycle-interval <d>` | `1m` | minimum wall-clock gap between successful `edit_self` evolutions |
 | `--once` | false | run a single step then exit |
 | `--resume` | false | internal: set across self-mod handoffs |
 
@@ -122,6 +148,7 @@ $EDITOR .env
 | `EVENT_LOG` | `./events.jsonl` | same as `--log` |
 | `SELF_MOD_ENABLED` | `true` | set to `false` to disable `edit_self` |
 | `MAX_STEPS` | `25` | iteration cap per process |
+| `CYCLE_INTERVAL` | `1m` | minimum duration between successful evolutions; `0` disables |
 
 ## Safety notes
 

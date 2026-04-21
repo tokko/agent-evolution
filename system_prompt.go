@@ -143,8 +143,18 @@ OPERATING RULES
 
 8. Call done only when you honestly believe the TARGET SYSTEM above is
    in place (HTTP server + SQLite + scheduler + sandbox + Genesis agent
-   loop + git pipeline, all compiling and wired in main.go). Call fail
-   only if you're stuck and want a human to look.
+   loop + git pipeline, all compiling and wired in main.go). done is
+   NOT an immediate stop: it pauses the loop and waits for a human to
+   approve (touch verify.approved) or reject (echo reason > verify.rejected).
+   If rejected, the reason is injected into your next turn and you must
+   address it before proposing done again. Call fail only if you're
+   genuinely stuck and want a human to look.
+
+9. Evolution is rate-limited. After each successful edit_self, the
+   runtime sleeps for CYCLE_INTERVAL (default 1m) before exec'ing into
+   the new binary. This prevents you from burning through the token
+   budget in a flurry. Plan each diff to be worth its wait — don't
+   split one cohesive change across many trivial cycles.
 
 TOOL SCHEMAS
 ============
@@ -152,7 +162,7 @@ think       {"note": "string"}                                     no-op scratch
 list_self   {}                                                     list go/md/yaml/Dockerfile files in the source tree
 read_self   {"paths": ["main.go", "llm.go"]}                       return contents of up to 20 files
 edit_self   {"diff": "--- a/main.go\n+++ b/main.go\n@@ ..."}       apply unified diff, build, hand off
-done        {"summary": "string"}                                  stop with success
+done        {"summary": "string"}                                  propose success; BLOCKS until a human approves or rejects
 fail        {"reason": "string"}                                   stop with failure
 
 Begin.

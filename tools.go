@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ToolResult is what dispatch returns for one tool call.
@@ -39,7 +40,7 @@ func dispatch(ctx context.Context, call ToolCall, cfg loopConfig, logger *EventL
 		}
 		return toolEditSelf(ctx, cfg.selfSrc, call.Args, logger)
 	case "done":
-		return toolTerminal("done", call.Args, "summary")
+		return toolDone(ctx, cfg, logger, call.Args)
 	case "fail":
 		return toolTerminal("fail", call.Args, "reason")
 	default:
@@ -193,6 +194,112 @@ func toolTerminal(kind string, args json.RawMessage, field string) ToolResult {
 	return ToolResult{
 		Result:   kind + ": " + msg,
 		Terminal: kind,
+	}
+}
+
+// verifyPollInterval is how often toolDone checks for approve/reject files.
+var verifyPollInterval = 10 * time.Second
+
+// toolDone is NOT an immediate terminal. The agent uses it to declare "I
+// believe I've reached the target system." Before the loop actually stops,
+// a human must confirm by creating verify.approved in the source dir (or
+// reject by creating verify.rejected, optionally with a reason). This
+// prevents the model from halting evolution prematurely.
+//
+// While waiting, the process is idle: no LLM calls, no CPU. The poll
+// checks a sidecar file every verifyPollInterval and honors ctx
+// cancellation (Ctrl-C / SIGTERM) so the user can always abort.
+//
+//   APPROVE: terminal "done" — loop ends.
+//   REJECT:  terminal ""     — loop continues, with the rejection reason
+//            injected into the next user message so the model sees it.
+func toolDone(ctx context.Context, cfg loopConfig, logger *EventLog, args json.RawMessage) ToolResult {
+	var in struct {
+		Summary string `json:"summary"`
+	}
+	_ = json.Unmarshal(args, &in)
+	summary := strings.TrimSpace(in.Summary)
+	if summary == "" {
+		summary = "(no summary provided)"
+	}
+
+	root := cfg.selfSrc
+	pendingPath := filepath.Join(root, "verify.pending")
+	approvedPath := filepath.Join(root, "verify.approved")
+	rejectedPath := filepath.Join(root, "verify.rejected")
+
+	// Clear any stale markers from a previous round.
+	_ = os.Remove(approvedPath)
+	_ = os.Remove(rejectedPath)
+
+	pendingBody := fmt.Sprintf(`# Agent believes it has reached the target system.
+#
+# To APPROVE (stop the loop and mark success):
+#     touch %s
+#
+# To REJECT (keep evolving; put the reason in the file):
+#     echo "you still need X, Y, Z" > %s
+#
+# Poll interval: %s. Ctrl-C on the daemon also aborts.
+#
+# Proposed at: %s
+
+SUMMARY:
+%s
+`,
+		approvedPath,
+		rejectedPath,
+		verifyPollInterval,
+		time.Now().UTC().Format(time.RFC3339),
+		summary,
+	)
+	if err := os.WriteFile(pendingPath, []byte(pendingBody), 0o644); err != nil {
+		return ToolResult{Err: fmt.Errorf("done: write %s: %w", pendingPath, err)}
+	}
+	logger.Write("verification_pending", map[string]any{
+		"summary":      summary,
+		"pending_path": pendingPath,
+	})
+	fmt.Fprintf(os.Stderr,
+		"\n[VERIFY] Agent claims it has reached the target system. Review:\n  cat %s\nThen APPROVE:\n  touch %s\nOr REJECT with a reason:\n  echo 'why not' > %s\nPolling every %s. Ctrl-C to abort.\n\n",
+		pendingPath, approvedPath, rejectedPath, verifyPollInterval,
+	)
+
+	ticker := time.NewTicker(verifyPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Write("verification_canceled", map[string]any{"err": ctx.Err().Error()})
+			_ = os.Remove(pendingPath)
+			return ToolResult{Err: ctx.Err()}
+		case <-ticker.C:
+			if _, err := os.Stat(approvedPath); err == nil {
+				_ = os.Remove(pendingPath)
+				_ = os.Remove(approvedPath)
+				logger.Write("verification_approved", map[string]any{"summary": summary})
+				fmt.Fprintf(os.Stderr, "[VERIFY] approved.\n")
+				return ToolResult{
+					Result:   "human approved: " + summary,
+					Terminal: "done",
+				}
+			}
+			if data, err := os.ReadFile(rejectedPath); err == nil {
+				reason := strings.TrimSpace(string(data))
+				if reason == "" {
+					reason = "(no reason given)"
+				}
+				_ = os.Remove(pendingPath)
+				_ = os.Remove(rejectedPath)
+				logger.Write("verification_rejected", map[string]any{"reason": reason})
+				fmt.Fprintf(os.Stderr, "[VERIFY] rejected: %s\n", truncate(reason, 200))
+				return ToolResult{
+					Result: "HUMAN REJECTED your done claim. Reason: " + reason +
+						". Do NOT call done again until the rejection is addressed. Keep evolving.",
+					// Terminal "" → loop continues.
+				}
+			}
+		}
 	}
 }
 

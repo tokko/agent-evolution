@@ -55,3 +55,48 @@ func runDiff(ctx context.Context, dir string, args []string, diff string) (strin
 	err := cmd.Run()
 	return buf.String(), err
 }
+
+// PromoteBinary atomically moves a freshly built binary (src, typically
+// bin/daemon.new) into place as the canonical binary (dest, typically
+// bin/daemon), backing up the previous dest to dest+".prev".
+//
+// On Linux/macOS this works even when dest is the currently-running
+// executable: the rename is atomic at the directory-entry level and the
+// kernel keeps the already-loaded old image mapped as long as this process
+// lives. On Windows the running .exe is locked by the OS, so the rename
+// fails; in that case we fall back to returning src unchanged so the caller
+// can still exec into it — Windows self-mod was already advertised as
+// compile-check-only.
+//
+// Returns the absolute path that subsequent callers should run.
+func PromoteBinary(src, dest string) (string, error) {
+	if src == "" {
+		return "", fmt.Errorf("promote: empty src")
+	}
+	if dest == "" {
+		return src, nil
+	}
+	if _, err := os.Stat(src); err != nil {
+		return "", fmt.Errorf("promote: stat src %q: %w", src, err)
+	}
+	absSrc, _ := filepath.Abs(src)
+	absDest, _ := filepath.Abs(dest)
+	if absSrc == absDest {
+		return absSrc, nil
+	}
+
+	// Back up the previous dest (best-effort).
+	if _, err := os.Stat(absDest); err == nil {
+		backup := absDest + ".prev"
+		_ = os.Remove(backup)
+		if err := os.Rename(absDest, backup); err != nil {
+			// On Windows this is where we land if the current binary is
+			// locked. Fall back to running out of src.
+			return absSrc, fmt.Errorf("promote: backup %q: %w (falling back to src)", absDest, err)
+		}
+	}
+	if err := os.Rename(absSrc, absDest); err != nil {
+		return absSrc, fmt.Errorf("promote: rename %q -> %q: %w (falling back to src)", absSrc, absDest, err)
+	}
+	return absDest, nil
+}

@@ -29,12 +29,13 @@ import (
 
 func main() {
 	var (
-		selfSrc   string
-		resume    bool
-		maxSteps  int
-		logPath   string
-		oneShot   bool
-		sleepSecs int
+		selfSrc           string
+		resume            bool
+		maxSteps          int
+		logPath           string
+		oneShot           bool
+		sleepSecs         int
+		cycleIntervalStr  string
 	)
 	flag.StringVar(&selfSrc, "self-src", "", "path to the agent's own source tree (default: dir of the running binary, or cwd if unknown)")
 	flag.BoolVar(&resume, "resume", false, "internal: set across self-mod handoffs so the new binary knows it woke up from an edit_self")
@@ -42,6 +43,7 @@ func main() {
 	flag.StringVar(&logPath, "log", "", "path to the append-only JSONL event log (default: ./events.jsonl)")
 	flag.BoolVar(&oneShot, "once", false, "run a single step then exit (useful for debugging)")
 	flag.IntVar(&sleepSecs, "sleep", 0, "seconds to wait between steps (default: 0; useful when running on a loop)")
+	flag.StringVar(&cycleIntervalStr, "cycle-interval", "", "minimum wall-clock duration between successful edit_self evolutions (e.g. 1m, 5m). 0 = no gate. Default: CYCLE_INTERVAL env var or 1m.")
 	flag.Parse()
 
 	_ = loadDotenv(".env") // non-fatal
@@ -67,6 +69,17 @@ func main() {
 		logPath = getenvDefault("EVENT_LOG", "./events.jsonl")
 	}
 
+	if cycleIntervalStr == "" {
+		cycleIntervalStr = getenvDefault("CYCLE_INTERVAL", "1m")
+	}
+	cycleInterval, err := time.ParseDuration(cycleIntervalStr)
+	if err != nil {
+		die("parse --cycle-interval %q: %v", cycleIntervalStr, err)
+	}
+	if cycleInterval < 0 {
+		cycleInterval = 0
+	}
+
 	apiKey := os.Getenv("MINIMAX_API_KEY")
 	if apiKey == "" || apiKey == "REPLACE_ME" {
 		die("MINIMAX_API_KEY is not set (edit .env or export it)")
@@ -88,12 +101,13 @@ func main() {
 		bootKind = "resumed"
 	}
 	logger.Write(bootKind, map[string]any{
-		"self_src":   selfSrc,
-		"model":      model,
-		"max_steps":  maxSteps,
-		"self_mod":   selfModEnabled,
-		"goos":       runtime.GOOS,
-		"at":         time.Now().UTC().Format(time.RFC3339),
+		"self_src":       selfSrc,
+		"model":          model,
+		"max_steps":      maxSteps,
+		"self_mod":       selfModEnabled,
+		"cycle_interval": cycleInterval.String(),
+		"goos":           runtime.GOOS,
+		"at":             time.Now().UTC().Format(time.RFC3339),
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -114,9 +128,45 @@ func main() {
 	}
 
 	if outcome == "handoff" && newBin != "" {
-		logger.Write("handoff_exec", map[string]any{"new_bin": newBin})
+		// Promote bin/daemon.new → bin/daemon so subsequent restarts pick
+		// up the evolution. Safe on Linux even when the current binary is
+		// still executing; on Windows the rename may fail and we fall back
+		// to exec'ing into newBin directly.
+		canonical := filepath.Join(selfSrc, "bin", "daemon")
+		if runtime.GOOS == "windows" {
+			canonical += ".exe"
+		}
+		promoted, perr := PromoteBinary(newBin, canonical)
+		if perr != nil {
+			slog.Warn("promote binary failed; running from newBin", "err", perr)
+			logger.Write("promote_warn", map[string]any{"err": perr.Error()})
+		} else {
+			logger.Write("promoted", map[string]any{"from": newBin, "to": promoted})
+		}
+
+		// Cycle-interval gate: pause before exec so successive evolutions
+		// can't burn through tokens faster than the configured cadence.
+		if cycleInterval > 0 {
+			logger.Write("cycle_cooldown", map[string]any{"duration": cycleInterval.String()})
+			slog.Info("cycle cooldown before handoff", "duration", cycleInterval)
+			select {
+			case <-ctx.Done():
+				logger.Write("cooldown_interrupted", nil)
+				logger.Write("exit", map[string]any{"outcome": "canceled_in_cooldown"})
+				return
+			case <-time.After(cycleInterval):
+			}
+		}
+
+		logger.Write("handoff_exec", map[string]any{"new_bin": promoted})
 		_ = logger.Close()
-		if err := Handoff(newBin, []string{"--resume", "--self-src", selfSrc, "--log", logPath}); err != nil {
+		handoffArgs := []string{
+			"--resume",
+			"--self-src", selfSrc,
+			"--log", logPath,
+			"--cycle-interval", cycleInterval.String(),
+		}
+		if err := Handoff(promoted, handoffArgs); err != nil {
 			die("handoff failed: %v", err)
 		}
 		return
