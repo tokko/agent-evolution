@@ -206,6 +206,16 @@ var verifyPollInterval = 10 * time.Second
 // reject by creating verify.rejected, optionally with a reason). This
 // prevents the model from halting evolution prematurely.
 //
+// The agent must provide:
+//   - summary:       one-line claim of what was achieved.
+//   - motivation:    why every target-system item is believed satisfied.
+//   - evidence:      concrete pointers (file paths, behaviors, log lines)
+//                    backing the motivation.
+//   - verification:  step-by-step instructions a human can execute to
+//                    check the claim. Each item should be a concrete
+//                    shell command or observation, NOT a vague
+//                    "verify the X works."
+//
 // While waiting, the process is idle: no LLM calls, no CPU. The poll
 // checks a sidecar file every verifyPollInterval and honors ctx
 // cancellation (Ctrl-C / SIGTERM) so the user can always abort.
@@ -215,12 +225,22 @@ var verifyPollInterval = 10 * time.Second
 //            injected into the next user message so the model sees it.
 func toolDone(ctx context.Context, cfg loopConfig, logger *EventLog, args json.RawMessage) ToolResult {
 	var in struct {
-		Summary string `json:"summary"`
+		Summary      string   `json:"summary"`
+		Motivation   string   `json:"motivation"`
+		Evidence     []string `json:"evidence"`
+		Verification []string `json:"verification"`
 	}
 	_ = json.Unmarshal(args, &in)
 	summary := strings.TrimSpace(in.Summary)
+	motivation := strings.TrimSpace(in.Motivation)
 	if summary == "" {
-		summary = "(no summary provided)"
+		return ToolResult{Err: errors.New("done: summary is required (one short line describing what was achieved)")}
+	}
+	if motivation == "" {
+		return ToolResult{Err: errors.New("done: motivation is required (a paragraph explaining why you believe every target-system item is satisfied). Without it, a human can't verify.")}
+	}
+	if len(in.Verification) == 0 {
+		return ToolResult{Err: errors.New("done: verification is required (a non-empty array of concrete, human-executable steps. Each item should be a shell command to run or a specific observation to make. Example: [\"curl -s localhost:8080/ | grep -q 'todo'\", \"sqlite3 memory.db '.tables' should list tasks, roles, attempts, events\"])")}
 	}
 
 	root := cfg.selfSrc
@@ -232,13 +252,26 @@ func toolDone(ctx context.Context, cfg loopConfig, logger *EventLog, args json.R
 	_ = os.Remove(approvedPath)
 	_ = os.Remove(rejectedPath)
 
+	evidenceBlock := "(none provided)"
+	if len(in.Evidence) > 0 {
+		var b strings.Builder
+		for i, e := range in.Evidence {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, strings.TrimSpace(e))
+		}
+		evidenceBlock = strings.TrimRight(b.String(), "\n")
+	}
+
+	var vb strings.Builder
+	for i, v := range in.Verification {
+		fmt.Fprintf(&vb, "  %d. %s\n", i+1, strings.TrimSpace(v))
+	}
+	verificationBlock := strings.TrimRight(vb.String(), "\n")
+
 	pendingBody := fmt.Sprintf(`# Agent believes it has reached the target system.
 #
-# To APPROVE (stop the loop and mark success):
-#     touch %s
-#
-# To REJECT (keep evolving; put the reason in the file):
-#     echo "you still need X, Y, Z" > %s
+# 1. Run through the HOW TO VERIFY steps below.
+# 2. If they all pass:    touch %s
+#    If something fails:  echo "what's missing" > %s
 #
 # Poll interval: %s. Ctrl-C on the daemon also aborts.
 #
@@ -246,18 +279,33 @@ func toolDone(ctx context.Context, cfg loopConfig, logger *EventLog, args json.R
 
 SUMMARY:
 %s
+
+MOTIVATION:
+%s
+
+EVIDENCE:
+%s
+
+HOW TO VERIFY (run each step in order):
+%s
 `,
 		approvedPath,
 		rejectedPath,
 		verifyPollInterval,
 		time.Now().UTC().Format(time.RFC3339),
 		summary,
+		motivation,
+		evidenceBlock,
+		verificationBlock,
 	)
 	if err := os.WriteFile(pendingPath, []byte(pendingBody), 0o644); err != nil {
 		return ToolResult{Err: fmt.Errorf("done: write %s: %w", pendingPath, err)}
 	}
 	logger.Write("verification_pending", map[string]any{
 		"summary":      summary,
+		"motivation":   motivation,
+		"evidence":     in.Evidence,
+		"verification": in.Verification,
 		"pending_path": pendingPath,
 	})
 	fmt.Fprintf(os.Stderr,

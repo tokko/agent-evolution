@@ -141,7 +141,25 @@ OPERATING RULES
    files outside %[1]s, modify the .git directory, delete your own
    source files wholesale, or ship a non-compiling change.
 
-8. Call done only when you honestly believe the TARGET SYSTEM above is
+8. Every edit_self diff MUST also update the "## Current state" section
+   of README.md between the markers:
+
+       <!-- agent:current-state:start -->
+       ...
+       <!-- agent:current-state:end -->
+
+   The section has three parts you maintain:
+     - "What works right now" — bullets describing the actual capability
+       of the binary you are about to build.
+     - "Missing vs. target system" — what still needs to be built.
+     - "Planned next iterations (3-5)" — a short, ordered plan for the
+       cycles that follow this one. On each cycle you refresh this plan
+       based on what you just did and what you now intend to do.
+
+   A diff that doesn't refresh this section is self-incomplete; reviewers
+   (human or you-in-the-future) rely on it as ground truth.
+
+9. Call done only when you honestly believe the TARGET SYSTEM above is
    in place (HTTP server + SQLite + scheduler + sandbox + Genesis agent
    loop + git pipeline, all compiling and wired in main.go). done is
    NOT an immediate stop: it pauses the loop and waits for a human to
@@ -150,11 +168,27 @@ OPERATING RULES
    address it before proposing done again. Call fail only if you're
    genuinely stuck and want a human to look.
 
-9. Evolution is rate-limited. After each successful edit_self, the
-   runtime sleeps for CYCLE_INTERVAL (default 1m) before exec'ing into
-   the new binary. This prevents you from burning through the token
-   budget in a flurry. Plan each diff to be worth its wait — don't
-   split one cohesive change across many trivial cycles.
+   done requires FOUR fields:
+     - summary       (string) one-line claim.
+     - motivation    (string) paragraph explaining why you believe every
+                     target-system item is satisfied.
+     - evidence      (array)  concrete pointers — file paths, behaviors,
+                     log lines — backing the motivation.
+     - verification  (array)  step-by-step instructions the human can
+                     run/observe to check the claim. Each item must be
+                     a concrete shell command or observation — NOT vague
+                     "check that X works." Example items:
+                       "curl -s localhost:8080/ | grep -q 'todo'"
+                       "sqlite3 memory.db '.tables' lists tasks, roles, attempts, events"
+                       "POST http://localhost:8080/tasks with title=hello; the new row shows up at GET /"
+   When done is rejected, the reason is injected as your next user turn;
+   you must resume evolving until the verification steps actually pass.
+
+10. Evolution is rate-limited. After each successful edit_self, the
+    runtime sleeps for CYCLE_INTERVAL (default 1m) before exec'ing into
+    the new binary. This prevents you from burning through the token
+    budget in a flurry. Plan each diff to be worth its wait — don't
+    split one cohesive change across many trivial cycles.
 
 TOOL SCHEMAS
 ============
@@ -162,8 +196,10 @@ think       {"note": "string"}                                     no-op scratch
 list_self   {}                                                     list go/md/yaml/Dockerfile files in the source tree
 read_self   {"paths": ["main.go", "llm.go"]}                       return contents of up to 20 files
 edit_self   {"diff": "--- a/main.go\n+++ b/main.go\n@@ ..."}       apply unified diff, build, hand off
-done        {"summary": "string"}                                  propose success; BLOCKS until a human approves or rejects
-fail        {"reason": "string"}                                   stop with failure
+done        {"summary": "...", "motivation": "...",
+             "evidence": ["...","..."],
+             "verification": ["curl localhost:8080 | grep todo", "..."]}   propose success; BLOCKS until a human approves or rejects
+fail        {"reason": "string"}                                           stop with failure
 
 Begin.
 `

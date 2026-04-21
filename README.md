@@ -20,6 +20,37 @@ The scaffold you start with has:
 No framework. No UI. No database. No sandbox. Those are the target, not
 the starting point.
 
+## Current state
+
+_This section is maintained by the agent itself. It is rewritten on every
+`edit_self` cycle to reflect what the running binary can actually do,
+what is still missing vs. the target, and what the agent plans to tackle
+in the next few iterations. If the agent ever calls `done`, the plan
+block is replaced with a motivation section explaining why it believes
+the target is reached._
+
+<!-- agent:current-state:start -->
+
+**What works right now**
+- Bootstrap loop: read own source → ask MiniMax for one diff → apply → build → promote → handoff.
+- Six tools: `think`, `list_self`, `read_self`, `edit_self`, `done`, `fail`.
+- Append-only JSONL event log at `./events.jsonl`.
+- Cycle cooldown + binary promotion + human-verified `done`.
+
+**Missing vs. target system**
+- HTTP kanban UI (`net/http` + `html/template`, 5 columns, meta-refresh).
+- SQLite persistence (`modernc.org/sqlite`): roles, tasks, attempts, events.
+- Docker sandbox for running generated code (`--network none`, 30 s, 256 MB).
+- Target-repo cloning + git pipeline (clone, read, write, commit, push).
+- Scheduler / single-worker loop that picks tasks off the board.
+- Role catalogue + Genesis seeding + `spawn_role` / `delegate` tools.
+- Per-task attempt timeline, routing by role, `MAX_STEPS` per attempt.
+
+**Planned next iterations (3–5)**
+1. _(bootstrap — the agent will fill this in on its first evolution cycle)_
+
+<!-- agent:current-state:end -->
+
 ## Install
 
 ```bash
