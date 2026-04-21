@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent-evolution installer
+# agent-evolution installer: minimal self-improving agent scaffold.
 #
 #   curl -fsSL https://raw.githubusercontent.com/tokko/agent-evolution/main/install.sh | bash
 #
@@ -7,7 +7,6 @@
 #   AE_DIR         target directory (default: $HOME/agent-evolution)
 #   AE_REF         git ref to check out (default: main)
 #   AE_SKIP_BUILD  set to 1 to skip `go build`
-#   AE_SKIP_IMAGE  set to 1 to skip `docker build` of the sandbox image
 
 set -euo pipefail
 
@@ -36,19 +35,13 @@ say "detected $os/$arch"
 
 case "$os" in
   linux|darwin) ;;
-  *) warn "unofficial OS: $os — proceeding, but the handoff path won't work" ;;
+  *) warn "unofficial OS: $os — proceeding, but the self-mod handoff path won't work" ;;
 esac
 
 # --- prerequisites ---------------------------------------------------------
 
 need git "install with your package manager (apt, brew, ...)"
 need go  "install Go 1.23+ from https://go.dev/dl/"
-
-if command -v docker >/dev/null 2>&1; then
-  say "docker present: $(docker --version)"
-else
-  warn "docker not found — the sandbox will refuse to run tasks until you install it"
-fi
 
 # --- clone or update -------------------------------------------------------
 
@@ -85,21 +78,6 @@ else
   say "built $(pwd)/bin/daemon ($(du -h bin/daemon | awk '{print $1}'))"
 fi
 
-# --- sandbox image ---------------------------------------------------------
-
-if [ "${AE_SKIP_IMAGE:-}" = "1" ]; then
-  warn "AE_SKIP_IMAGE=1 — skipping sandbox image build"
-elif command -v docker >/dev/null 2>&1; then
-  if docker image inspect agent-sandbox:latest >/dev/null 2>&1; then
-    say "sandbox image agent-sandbox:latest already present"
-  else
-    say "building sandbox image (agent-sandbox:latest)"
-    docker build -f sandbox.Dockerfile -t agent-sandbox:latest .
-  fi
-else
-  warn "skipping sandbox image build (no docker)"
-fi
-
 # --- next steps ------------------------------------------------------------
 
 cat <<EOF
@@ -108,9 +86,13 @@ $(say 'installed.')
 
 next steps:
   1) edit  $DIR/.env  and set MINIMAX_API_KEY (and MINIMAX_GROUP_ID if your account needs one)
-  2) run   $DIR/bin/daemon --repo <your-target-repo-url>
-  3) open  http://localhost:\${PORT:-8080}
+  2) run   $DIR/bin/daemon
+  3) watch $DIR/events.jsonl  (or tail -F it) to see what the agent is doing
 
-to update later, rerun this same curl | bash, or:
+the agent starts as a bare scaffold — it has no UI, no DB, no sandbox. Its
+job is to read its own source and evolve itself, one edit_self diff at a
+time, toward the target system described in system_prompt.go.
+
+to update the scaffold itself later, rerun this same curl | bash, or:
   cd $DIR && git pull && go build -o bin/daemon .
 EOF

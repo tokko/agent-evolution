@@ -1,8 +1,7 @@
 .env
-memory.db
-memory.db-*
+events.jsonl
+events-*.jsonl
 bin/
-workspace/
 tmp/
 *.exe
 daemon

@@ -6,168 +6,127 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
+// Minimal self-improving agent.
+//
+// The only thing this binary does is: read its own source, ask MiniMax for a
+// single unified-diff improvement toward the target system described in the
+// system prompt, apply the diff, build, and hand off to the new binary. Then
+// do it again.
+//
+// Everything else — a kanban board, a sandbox, a target-repo pipeline,
+// specialist roles — is the GOAL, not the starting point. The agent has to
+// build those itself via repeated edit_self steps.
+
 func main() {
-	// Flags
-	repoURL := flag.String("repo", "", "git URL of the target repo (required on first run)")
-	selfSrc := flag.String("self-src", "", "path to daemon's own source tree (default: cwd)")
-	resumeTask := flag.Int64("resume-task", 0, "internal: task id to resume after edit_self handoff")
+	var (
+		selfSrc   string
+		resume    bool
+		maxSteps  int
+		logPath   string
+		oneShot   bool
+		sleepSecs int
+	)
+	flag.StringVar(&selfSrc, "self-src", "", "path to the agent's own source tree (default: dir of the running binary, or cwd if unknown)")
+	flag.BoolVar(&resume, "resume", false, "internal: set across self-mod handoffs so the new binary knows it woke up from an edit_self")
+	flag.IntVar(&maxSteps, "max-steps", 0, "cap on agent-loop iterations in one process lifetime (0 = use MAX_STEPS env or default)")
+	flag.StringVar(&logPath, "log", "", "path to the append-only JSONL event log (default: ./events.jsonl)")
+	flag.BoolVar(&oneShot, "once", false, "run a single step then exit (useful for debugging)")
+	flag.IntVar(&sleepSecs, "sleep", 0, "seconds to wait between steps (default: 0; useful when running on a loop)")
 	flag.Parse()
 
-	_ = loadDotenv(".env") // non-fatal: env vars may already be set another way
+	_ = loadDotenv(".env") // non-fatal
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg := loadConfig()
-	if *selfSrc == "" {
-		cwd, _ := os.Getwd()
-		*selfSrc = cwd
+	if selfSrc == "" {
+		selfSrc = guessSelfSrc()
 	}
-
-	// Open persistent state.
-	mem, err := Open(cfg.DBPath)
+	abs, err := filepath.Abs(selfSrc)
 	if err != nil {
-		die("open db: %v", err)
+		die("resolve --self-src: %v", err)
 	}
-	defer mem.Close()
+	selfSrc = abs
 
-	roles := NewRoleStore(mem)
-	if _, err := roles.Genesis(); err != nil {
-		die("seed genesis: %v", err)
+	if maxSteps <= 0 {
+		maxSteps, _ = strconv.Atoi(getenvDefault("MAX_STEPS", "25"))
 	}
-	board := NewBoard(mem)
-
-	// Target repo.
-	var repo *Repo
-	if *repoURL != "" || existingWorkspace(cfg.Workspace) != "" {
-		url := *repoURL
-		root := cfg.Workspace
-		if url == "" {
-			// Nothing new to clone; reuse existing workspace.
-			root = existingWorkspace(cfg.Workspace)
-		} else {
-			root = filepath.Join(cfg.Workspace, repoNameFromURL(url))
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		repo, err = Clone(ctx, url, root)
-		cancel()
-		if err != nil {
-			slog.Warn("clone failed; running without repo", "err", err)
-			repo = nil
-		}
-	}
-	if repo == nil {
-		slog.Warn("no target repo configured; UI works but task execution will fail until --repo is set")
+	if maxSteps <= 0 {
+		maxSteps = 25
 	}
 
-	sbx := NewSandbox(cfg.SandboxImage, 30*time.Second, "sandbox.Dockerfile")
-	// Best-effort sandbox image build; don't fail startup if docker is missing.
-	if err := sbx.EnsureImage(context.Background()); err != nil {
-		slog.Warn("sandbox image not ready", "err", err)
+	if logPath == "" {
+		logPath = getenvDefault("EVENT_LOG", "./events.jsonl")
 	}
 
-	llm := NewLLM(cfg.APIKey, cfg.GroupID, cfg.Model)
-
-	workspacePath := ""
-	if repo != nil {
-		workspacePath = repo.Root
+	apiKey := os.Getenv("MINIMAX_API_KEY")
+	if apiKey == "" || apiKey == "REPLACE_ME" {
+		die("MINIMAX_API_KEY is not set (edit .env or export it)")
 	}
-	deps := AgentDeps{
-		LLM:       llm,
-		Sandbox:   sbx,
-		Repo:      repo,
-		Mem:       mem,
-		Roles:     roles,
-		Board:     board,
-		SelfSrc:   *selfSrc,
-		Workspace: workspacePath,
-		MaxSteps:  cfg.MaxSteps,
-		SelfMod:   cfg.SelfMod,
-	}
+	model := getenvDefault("MODEL", "MiniMax-M2.7")
+	groupID := os.Getenv("MINIMAX_GROUP_ID")
+	selfModEnabled := strings.EqualFold(getenvDefault("SELF_MOD_ENABLED", "true"), "true")
 
-	// Signal-rooted context.
+	llm := NewLLM(apiKey, groupID, model)
+
+	logger, err := NewEventLog(logPath)
+	if err != nil {
+		die("open event log %q: %v", logPath, err)
+	}
+	defer logger.Close()
+
+	bootKind := "boot"
+	if resume {
+		bootKind = "resumed"
+	}
+	logger.Write(bootKind, map[string]any{
+		"self_src":   selfSrc,
+		"model":      model,
+		"max_steps":  maxSteps,
+		"self_mod":   selfModEnabled,
+		"goos":       runtime.GOOS,
+		"at":         time.Now().UTC().Format(time.RFC3339),
+	})
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// HTTP server.
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: NewServer(board, mem).Handler()}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		slog.Info("http listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("http", "err", err)
-			cancel()
-		}
-	}()
+	cfg := loopConfig{
+		selfSrc:  selfSrc,
+		maxSteps: maxSteps,
+		sleep:    time.Duration(sleepSecs) * time.Second,
+		oneShot:  oneShot,
+		selfMod:  selfModEnabled,
+	}
 
-	// Scheduler.
-	sched := NewScheduler(deps, 2*time.Second)
-	var schedErr error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		schedErr = sched.Loop(ctx, *resumeTask)
-		// Scheduler exiting on its own (e.g. handoff) should trigger shutdown.
-		cancel()
-	}()
+	outcome, newBin, err := runLoop(ctx, llm, logger, cfg)
+	if err != nil {
+		slog.Error("loop ended with error", "err", err)
+		logger.Write("fatal", map[string]any{"err": err.Error()})
+	}
 
-	<-ctx.Done()
-	slog.Info("shutting down")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = srv.Shutdown(shutdownCtx)
-	shutdownCancel()
-	wg.Wait()
-
-	if sched.HandoffBin != "" {
-		slog.Info("handing off to new binary", "bin", sched.HandoffBin, "task", sched.HandoffTaskID)
-		_ = mem.Close()
-		if err := Handoff(sched.HandoffBin, append([]string{"--resume-task", strconv.FormatInt(sched.HandoffTaskID, 10)}, passthroughArgs(*repoURL, *selfSrc)...)); err != nil {
+	if outcome == "handoff" && newBin != "" {
+		logger.Write("handoff_exec", map[string]any{"new_bin": newBin})
+		_ = logger.Close()
+		if err := Handoff(newBin, []string{"--resume", "--self-src", selfSrc, "--log", logPath}); err != nil {
 			die("handoff failed: %v", err)
 		}
+		return
 	}
-	if schedErr != nil && schedErr != context.Canceled {
-		die("scheduler: %v", schedErr)
-	}
+
+	logger.Write("exit", map[string]any{"outcome": outcome})
 }
 
-// Config is the runtime env snapshot.
-type Config struct {
-	APIKey, GroupID, Model, Port, DBPath, Workspace, SandboxImage string
-	MaxSteps                                                      int
-	SelfMod                                                       bool
-}
-
-func loadConfig() Config {
-	c := Config{
-		APIKey:       os.Getenv("MINIMAX_API_KEY"),
-		GroupID:      os.Getenv("MINIMAX_GROUP_ID"),
-		Model:        getenvDefault("MODEL", "MiniMax-M2.7"),
-		Port:         getenvDefault("PORT", "8080"),
-		DBPath:       getenvDefault("DB_PATH", "./memory.db"),
-		Workspace:    getenvDefault("WORKSPACE", "./workspace"),
-		SandboxImage: getenvDefault("SANDBOX_IMAGE", "agent-sandbox:latest"),
-		SelfMod:      strings.EqualFold(getenvDefault("SELF_MOD_ENABLED", "true"), "true"),
-	}
-	c.MaxSteps, _ = strconv.Atoi(getenvDefault("MAX_STEPS", "25"))
-	if c.MaxSteps <= 0 {
-		c.MaxSteps = 25
-	}
-	return c
-}
-
-// loadDotenv parses a trivial KEY=VALUE file. Lines starting with # and blank
-// lines are skipped. Existing env vars are NOT overridden.
+// loadDotenv parses a trivial KEY=VALUE file. Blank lines and #-comments are
+// skipped. Already-set env vars are NOT overridden, so shell env wins.
 func loadDotenv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -201,44 +160,22 @@ func getenvDefault(k, def string) string {
 	return def
 }
 
-func repoNameFromURL(u string) string {
-	u = strings.TrimSuffix(u, ".git")
-	if i := strings.LastIndexAny(u, "/:"); i >= 0 {
-		u = u[i+1:]
-	}
-	if u == "" {
-		u = "repo"
-	}
-	return u
-}
-
-// existingWorkspace returns the first subdirectory of root that looks like a
-// git working copy, so a restart without --repo still finds what was cloned.
-func existingWorkspace(root string) string {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+// guessSelfSrc picks the directory of the running binary, unless that looks
+// like a temp-install location (e.g. ~/.local/bin); otherwise cwd.
+func guessSelfSrc() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		// If the binary sits in bin/ of a source tree, prefer the parent.
+		if filepath.Base(dir) == "bin" {
+			return filepath.Dir(dir)
 		}
-		if _, err := os.Stat(filepath.Join(root, e.Name(), ".git")); err == nil {
-			return filepath.Join(root, e.Name())
+		// Heuristic: if there's a go.mod next to the binary, use that dir.
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
 		}
 	}
-	return ""
-}
-
-func passthroughArgs(repo, selfSrc string) []string {
-	var out []string
-	if repo != "" {
-		out = append(out, "--repo", repo)
-	}
-	if selfSrc != "" {
-		out = append(out, "--self-src", selfSrc)
-	}
-	return out
+	cwd, _ := os.Getwd()
+	return cwd
 }
 
 func die(format string, args ...any) {
